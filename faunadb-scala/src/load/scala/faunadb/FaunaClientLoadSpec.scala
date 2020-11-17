@@ -2,6 +2,7 @@ package faunadb
 
 import java.util
 import java.util.concurrent.Flow
+import java.util.logging.Logger
 
 import faunadb.errors.BadRequestException
 import faunadb.query._
@@ -9,6 +10,7 @@ import faunadb.values._
 import org.scalatest.concurrent.{IntegrationPatience, ScalaFutures}
 import org.scalatest.wordspec.FixtureAsyncWordSpec
 import org.scalatest.matchers.should.Matchers
+import org.slf4j.LoggerFactory
 
 import scala.collection.JavaConverters.asScalaIteratorConverter
 import scala.concurrent.{Future, Promise}
@@ -86,6 +88,68 @@ class FaunaClientLoadSpec extends FixtureAsyncWordSpec with Matchers with ScalaF
   }
 
   "When streaming" should {
+
+    "not kill idle streams" in { client =>
+      val subscriberDone = Promise[List[Value]]
+      val bufferSize = 256
+      val log = LoggerFactory.getLogger(getClass());
+      // create collection
+      val collectionName = RandomGenerator.aRandomString
+      val setup = for {
+        _ <- client.query(CreateCollection(Obj("name" -> collectionName)))
+        createdDoc <- client.query(Create(Collection(collectionName), Obj("credentials" -> Obj("password" -> "abcdefg"))))
+        docRef = createdDoc("ref")
+        publisherValue <- client.stream(docRef)
+      } yield (docRef, publisherValue)
+
+      setup.flatMap { case (docRef, publisherValue) =>
+        val valueSubscriber = new Flow.Subscriber[Value] {
+          var subscription: Flow.Subscription = _
+          val captured = new util.ArrayList[Value]
+
+          override def onSubscribe(s: Flow.Subscription): Unit = {
+            subscription = s
+            subscription.request(1)
+          }
+
+          override def onNext(v: Value): Unit = {
+            if (captured.isEmpty) {
+              log.info("going to sleep!")
+              Thread.sleep(6000)
+              log.info("done sleeping!")
+              // update doc `bufferSize` times on `start` event
+              (1 to bufferSize).iterator
+                .map(i => s"testValue$i")
+                .foreach { uv =>
+                  // blocking call to update document sequentially
+                  client.query(Update(docRef, Obj("data" -> Obj("testField" -> uv)))).futureValue
+                }
+              captured.add(v)
+              subscription.request(1) // ask for more elements
+            } else {
+              captured.add(v) // capture element
+              if (captured.size > bufferSize) {
+                subscription.cancel()
+                subscriberDone.success(captured.iterator().asScala.toList)
+              } else {
+                subscription.request(1) // ask for more elements
+              }
+            }
+          }
+
+          override def onError(t: Throwable): Unit = subscriberDone.failure(t)
+
+          override def onComplete(): Unit = subscriberDone.failure(new IllegalStateException("not expecting the stream to complete"))
+        }
+
+        // subscribe to publisher
+        publisherValue.subscribe(valueSubscriber)
+
+        // blocking
+        subscriberDone.future.map(_.size should be(bufferSize + 1))
+      }
+    }
+
     "buffers events if the producer is faster than the consumer" in { client =>
       val subscriberDone = Promise[List[Value]]
       val bufferSize = 256
